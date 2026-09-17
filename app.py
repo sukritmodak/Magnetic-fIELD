@@ -1,21 +1,28 @@
 import streamlit as st
 import numpy as np
 import pandas as pd
-import cv2
-import tempfile
 from PIL import Image
+import cv2
 from sklearn.linear_model import LinearRegression
 from sklearn.preprocessing import PolynomialFeatures
 from sklearn.pipeline import make_pipeline
 
-st.set_page_config(page_title="CRT Magnetic Field Analyzer", page_icon="🧲", layout="wide")
-st.title("🧲 CRT Magnetic Field Analyzer")
-st.write("Analyze red, green and blue CRT changes caused by an external magnet.")
+st.set_page_config(
+    page_title="CRT Magnetic Field Analyzer",
+    page_icon="🧲",
+    layout="wide"
+)
+
+st.title("🧲 Calibrated CRT Magnetic Field Visualization, Mapping & Attenuation")
+st.caption(
+    "Segmented analysis of CRT color response. The no-magnet reference is separated from the magnetic-source and object-response measurements."
+)
 
 st.warning(
     "An image or video does not contain an absolute mT value by itself. "
     "Use calibration images measured with a Hall probe or gaussmeter."
 )
+
 
 def prep(img, size=(640, 480)):
     arr = np.array(img.convert("RGB"))
@@ -23,12 +30,14 @@ def prep(img, size=(640, 480)):
     side = int(min(w, h) * 0.85)
     x = (w - side) // 2
     y = (h - side) // 2
-    crop = arr[y:y+side, x:x+side]
+    crop = arr[y:y + side, x:x + side]
     return cv2.resize(crop, size, interpolation=cv2.INTER_AREA)
+
 
 def rgb_values(img):
     a = np.asarray(img).astype(np.float32)
     return a[:, :, 0].mean(), a[:, :, 1].mean(), a[:, :, 2].mean()
+
 
 def response(reference, test):
     a = prep(reference).astype(np.float32) / 255.0
@@ -47,11 +56,13 @@ def response(reference, test):
 
     return float(0.50 * rgb_change + 0.35 * color_change + 0.15 * edge_change)
 
+
 def diff_image(a, b):
     x = prep(a)
     y = prep(b)
     d = cv2.absdiff(x, y)
     return cv2.normalize(d, None, 0, 255, cv2.NORM_MINMAX)
+
 
 def heatmap(reference, test, n=30):
     a = prep(reference).astype(np.float32) / 255.0
@@ -60,13 +71,14 @@ def heatmap(reference, test, n=30):
     h, w = d.shape
     out = np.zeros((n, n), dtype=np.float32)
     for r in range(n):
-        y1, y2 = int(r*h/n), int((r+1)*h/n)
+        y1, y2 = int(r * h / n), int((r + 1) * h / n)
         for c in range(n):
-            x1, x2 = int(c*w/n), int((c+1)*w/n)
+            x1, x2 = int(c * w / n), int((c + 1) * w / n)
             cell = d[y1:y2, x1:x2]
             if cell.size:
                 out[r, c] = cell.mean()
     return out
+
 
 def build_model(x, y, degree):
     X = np.asarray(x, dtype=float).reshape(-1, 1)
@@ -77,6 +89,7 @@ def build_model(x, y, degree):
         model = make_pipeline(PolynomialFeatures(degree), LinearRegression())
     model.fit(X, Y)
     return model
+
 
 def analyze_video(path, reference, every=5, max_frames=300):
     cap = cv2.VideoCapture(path)
@@ -110,6 +123,7 @@ def analyze_video(path, reference, every=5, max_frames=300):
 
     cap.release()
     return pd.DataFrame(rows)
+
 
 # ---------------- SIDEBAR CALIBRATION ----------------
 
@@ -167,6 +181,7 @@ if cal_ref_file and cal_files and field_text.strip():
     except Exception as e:
         st.sidebar.error("Calibration error: " + str(e))
 
+
 # ---------------- TABS ----------------
 
 photo, video = st.tabs(["📷 PHOTO ANALYSIS", "🎥 VIDEO ANALYSIS"])
@@ -196,7 +211,7 @@ with photo:
 
         ra = response(ref, a)
         rb = response(ref, b)
-        attenuation = max(0.0, min(100.0, (ra-rb)/ra*100.0)) if ra > 1e-9 else 0.0
+        attenuation = max(0.0, min(100.0, (ra - rb) / ra * 100.0)) if ra > 1e-9 else 0.0
 
         fa = model.predict([[ra]])[0] if model else None
         fb = model.predict([[rb]])[0] if model else None
