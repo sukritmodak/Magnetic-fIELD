@@ -1,370 +1,286 @@
+import streamlit as st
 import numpy as np
 import pandas as pd
-import streamlit as st
-from PIL import Image
 import cv2
+import tempfile
+from PIL import Image
 from sklearn.linear_model import LinearRegression
 from sklearn.preprocessing import PolynomialFeatures
 from sklearn.pipeline import make_pipeline
 
-st.set_page_config(page_title="CRT Magnetic Field Analyzer", layout="wide")
-
-st.title("CRT Magnetic Field Analyzer")
-st.caption("Prototype: image-based estimation from a calibrated CRT response.")
+st.set_page_config(page_title="CRT Magnetic Field Analyzer", page_icon="🧲", layout="wide")
+st.title("🧲 CRT Magnetic Field Analyzer")
+st.write("Analyze red, green and blue CRT changes caused by an external magnet.")
 
 st.warning(
-    "An ordinary photo cannot determine magnetic field strength in mT/G by itself. "
-    "This app estimates field strength only after calibration with known magnetic-field "
-    "values measured at the same CRT/setup. Treat the result as an experimental estimate, "
-    "not as a calibrated gaussmeter."
+    "An image or video does not contain an absolute mT value by itself. "
+    "Use calibration images measured with a Hall probe or gaussmeter."
 )
 
-def load_image(uploaded):
-    return Image.open(uploaded).convert("RGB")
+def prep(img, size=(640, 480)):
+    arr = np.array(img.convert("RGB"))
+    h, w = arr.shape[:2]
+    side = int(min(w, h) * 0.85)
+    x = (w - side) // 2
+    y = (h - side) // 2
+    crop = arr[y:y+side, x:x+side]
+    return cv2.resize(crop, size, interpolation=cv2.INTER_AREA)
 
-def center_crop(im, frac=0.80):
-    w, h = im.size
-    cw, ch = int(w * frac), int(h * frac)
-    left, top = (w - cw) // 2, (h - ch) // 2
-    return im.crop((left, top, left + cw, top + ch))
+def rgb_values(img):
+    a = np.asarray(img).astype(np.float32)
+    return a[:, :, 0].mean(), a[:, :, 1].mean(), a[:, :, 2].mean()
 
-def prep(im, size=(640, 480)):
-    arr = np.array(im)
-    return cv2.resize(arr, size, interpolation=cv2.INTER_AREA)
+def response(reference, test):
+    a = prep(reference).astype(np.float32) / 255.0
+    b = prep(test).astype(np.float32) / 255.0
+    rgb_change = np.mean(np.abs(a - b))
 
-def response_score(reference, test):
-    """
-    Dimensionless image-response metric.
+    la = cv2.cvtColor((a * 255).astype(np.uint8), cv2.COLOR_RGB2LAB).astype(np.float32)
+    lb = cv2.cvtColor((b * 255).astype(np.uint8), cv2.COLOR_RGB2LAB).astype(np.float32)
+    color_change = np.mean(np.linalg.norm(la - lb, axis=2)) / 100.0
 
-    It combines:
-      - luminance/color change
-      - RGB pixel change
-      - edge/geometry change
+    ga = cv2.cvtColor((a * 255).astype(np.uint8), cv2.COLOR_RGB2GRAY)
+    gb = cv2.cvtColor((b * 255).astype(np.uint8), cv2.COLOR_RGB2GRAY)
+    ea = cv2.Canny(ga, 50, 150)
+    eb = cv2.Canny(gb, 50, 150)
+    edge_change = np.mean(cv2.absdiff(ea, eb)) / 255.0
 
-    This is a calibration metric, NOT a direct physical magnetic-field unit.
-    """
-    ref = prep(center_crop(reference))
-    tst = prep(center_crop(test))
+    return float(0.50 * rgb_change + 0.35 * color_change + 0.15 * edge_change)
 
-    ref_f = ref.astype(np.float32) / 255.0
-    tst_f = tst.astype(np.float32) / 255.0
+def diff_image(a, b):
+    x = prep(a)
+    y = prep(b)
+    d = cv2.absdiff(x, y)
+    return cv2.normalize(d, None, 0, 255, cv2.NORM_MINMAX)
 
-    lab_r = cv2.cvtColor(ref, cv2.COLOR_RGB2LAB).astype(np.float32)
-    lab_t = cv2.cvtColor(tst, cv2.COLOR_RGB2LAB).astype(np.float32)
-    color_delta = np.mean(np.linalg.norm(lab_t - lab_r, axis=2)) / 100.0
+def heatmap(reference, test, n=30):
+    a = prep(reference).astype(np.float32) / 255.0
+    b = prep(test).astype(np.float32) / 255.0
+    d = np.mean(np.abs(a - b), axis=2)
+    h, w = d.shape
+    out = np.zeros((n, n), dtype=np.float32)
+    for r in range(n):
+        y1, y2 = int(r*h/n), int((r+1)*h/n)
+        for c in range(n):
+            x1, x2 = int(c*w/n), int((c+1)*w/n)
+            cell = d[y1:y2, x1:x2]
+            if cell.size:
+                out[r, c] = cell.mean()
+    return out
 
-    gray_r = cv2.cvtColor(ref, cv2.COLOR_RGB2GRAY)
-    gray_t = cv2.cvtColor(tst, cv2.COLOR_RGB2GRAY)
-    edges_r = cv2.Canny(gray_r, 50, 150)
-    edges_t = cv2.Canny(gray_t, 50, 150)
-    edge_delta = np.mean(cv2.absdiff(edges_r, edges_t)) / 255.0
-
-    pixel_delta = np.mean(np.abs(tst_f - ref_f))
-
-    return float(
-        0.55 * color_delta +
-        0.30 * pixel_delta +
-        0.15 * edge_delta
-    )
-
-def fit_calibration(x, y, degree=2):
-    x = np.asarray(x, dtype=float).reshape(-1, 1)
-    y = np.asarray(y, dtype=float)
-
+def build_model(x, y, degree):
+    X = np.asarray(x, dtype=float).reshape(-1, 1)
+    Y = np.asarray(y, dtype=float)
     if degree == 1:
-        return LinearRegression().fit(x, y)
+        model = LinearRegression()
+    else:
+        model = make_pipeline(PolynomialFeatures(degree), LinearRegression())
+    model.fit(X, Y)
+    return model
 
-    return make_pipeline(
-        PolynomialFeatures(degree=degree),
-        LinearRegression()
-    ).fit(x, y)
+def analyze_video(path, reference, every=5, max_frames=300):
+    cap = cv2.VideoCapture(path)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    rows = []
+    frame_no = 0
+    count = 0
 
-def r2_score_manual(model, x, y):
-    pred = model.predict(np.asarray(x).reshape(-1, 1))
-    y = np.asarray(y)
-    ss_res = np.sum((y - pred) ** 2)
-    ss_tot = np.sum((y - y.mean()) ** 2)
-    return 1.0 if ss_tot == 0 else 1 - ss_res / ss_tot
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
 
-def estimate_uncertainty(model, x, y, x_new):
-    pred = model.predict(np.asarray(x).reshape(-1, 1))
-    residual = np.asarray(y) - pred
+        if frame_no % every == 0:
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            img = Image.fromarray(rgb)
+            r, g, b = rgb_values(img)
+            rows.append({
+                "Frame": frame_no,
+                "Time_s": frame_no / fps,
+                "Red": r,
+                "Green": g,
+                "Blue": b,
+                "CRT_Response": response(reference, img)
+            })
+            count += 1
+            if count >= max_frames:
+                break
 
-    if len(residual) < 3:
-        return None
+        frame_no += 1
 
-    rmse = float(np.sqrt(np.mean(residual ** 2)))
+    cap.release()
+    return pd.DataFrame(rows)
 
-    eps = max(abs(float(x_new)) * 1e-4, 1e-6)
-    y1 = float(model.predict([[float(x_new) - eps]])[0])
-    y2 = float(model.predict([[float(x_new) + eps]])[0])
-    slope = abs((y2 - y1) / (2 * eps))
+# ---------------- SIDEBAR CALIBRATION ----------------
 
-    return rmse * slope if slope > 1e-12 else None
+st.sidebar.header("🧲 Calibration")
 
-
-# ---------------- Calibration ----------------
-st.sidebar.header("1. Calibration")
-st.sidebar.write(
-    "Calibration must use the same CRT, camera, distance, exposure, brightness, "
-    "contrast and magnet geometry used during measurement."
-)
-
-ref_cal_file = st.sidebar.file_uploader(
-    "Calibration reference image (usually zero-field)",
+cal_ref_file = st.sidebar.file_uploader(
+    "Reference / zero-field image",
     type=["png", "jpg", "jpeg", "webp"],
-    key="ref_cal"
+    key="cal_ref"
 )
 
 cal_files = st.sidebar.file_uploader(
-    "Calibration test images (multiple)",
+    "Calibration images",
     type=["png", "jpg", "jpeg", "webp"],
     accept_multiple_files=True,
     key="cal_files"
 )
 
-known_text = st.sidebar.text_input(
-    "Known field values in mT, in the SAME order as calibration files",
-    placeholder="Example: 5, 10, 20, 40"
+field_text = st.sidebar.text_input(
+    "Known fields in mT",
+    placeholder="0,5,10,20,30,40"
 )
 
-degree = st.sidebar.selectbox(
-    "Calibration curve",
-    [1, 2, 3],
-    index=1
-)
+degree = st.sidebar.selectbox("Calibration curve", [1, 2, 3], index=1)
 
 model = None
-cal_table = None
 
-if ref_cal_file and cal_files and known_text.strip():
+if cal_ref_file and cal_files and field_text.strip():
     try:
-        known = [
-            float(v.strip())
-            for v in known_text.split(",")
-            if v.strip()
-        ]
-
-        if len(known) != len(cal_files):
-            st.sidebar.error(
-                "The number of field values must equal the number of calibration images."
-            )
-        elif len(cal_files) < degree + 1:
-            st.sidebar.error(
-                f"Use at least {degree + 1} calibration images for a degree-{degree} curve."
-            )
+        fields = [float(x.strip()) for x in field_text.split(",") if x.strip()]
+        if len(fields) != len(cal_files):
+            st.sidebar.error("Number of field values must equal number of calibration images.")
+        elif len(fields) < degree + 1:
+            st.sidebar.error("Add more calibration points.")
         else:
-            ref_cal = load_image(ref_cal_file)
-
-            scores = []
+            ref = Image.open(cal_ref_file).convert("RGB")
+            responses = []
             for f in cal_files:
-                scores.append(
-                    response_score(ref_cal, load_image(f))
-                )
+                responses.append(response(ref, Image.open(f).convert("RGB")))
 
-            cal_table = pd.DataFrame({
+            table = pd.DataFrame({
                 "Image": [f.name for f in cal_files],
-                "Known field (mT)": known,
-                "Response score": scores
-            }).sort_values("Known field (mT)")
+                "Field_mT": fields,
+                "CRT_Response": responses
+            }).sort_values("Field_mT").reset_index(drop=True)
 
-            model = fit_calibration(
-                cal_table["Response score"].values,
-                cal_table["Known field (mT)"].values,
-                degree=degree
+            model = build_model(
+                table["CRT_Response"].values,
+                table["Field_mT"].values,
+                degree
             )
-
-            r2 = r2_score_manual(
-                model,
-                cal_table["Response score"].values,
-                cal_table["Known field (mT)"].values
-            )
-
-            st.sidebar.success(
-                f"Calibration loaded • R² = {r2:.4f}"
-            )
+            st.sidebar.success("Calibration loaded.")
+            st.sidebar.write(table)
 
     except Exception as e:
-        st.sidebar.error(f"Calibration error: {e}")
+        st.sidebar.error("Calibration error: " + str(e))
 
+# ---------------- TABS ----------------
 
-# ---------------- Measurement ----------------
-st.header("2. Measurement")
+photo, video = st.tabs(["📷 PHOTO ANALYSIS", "🎥 VIDEO ANALYSIS"])
 
-c1, c2 = st.columns(2)
+with photo:
+    st.header("Photo analysis")
+    c1, c2 = st.columns(2)
 
-with c1:
-    ref_file = st.file_uploader(
-        "A — Magnet present, NO object between magnet and CRT",
-        type=["png", "jpg", "jpeg", "webp"],
-        key="measurement_ref"
+    with c1:
+        f1 = st.file_uploader(
+            "A — Magnet only",
+            type=["png", "jpg", "jpeg", "webp"],
+            key="photo_a"
+        )
+
+    with c2:
+        f2 = st.file_uploader(
+            "B — Magnet + object",
+            type=["png", "jpg", "jpeg", "webp"],
+            key="photo_b"
+        )
+
+    if f1 and f2:
+        a = Image.open(f1).convert("RGB")
+        b = Image.open(f2).convert("RGB")
+        ref = Image.open(cal_ref_file).convert("RGB") if cal_ref_file else a
+
+        ra = response(ref, a)
+        rb = response(ref, b)
+        attenuation = max(0.0, min(100.0, (ra-rb)/ra*100.0)) if ra > 1e-9 else 0.0
+
+        fa = model.predict([[ra]])[0] if model else None
+        fb = model.predict([[rb]])[0] if model else None
+
+        x1, x2, x3 = st.columns(3)
+        x1.metric("Magnet response", f"{ra:.6f}")
+        x2.metric("Object response", f"{rb:.6f}")
+        x3.metric("Response reduction", f"{attenuation:.2f}%")
+
+        if model:
+            y1, y2 = st.columns(2)
+            y1.metric("Estimated field — magnet", f"{float(fa):.3f} mT")
+            y2.metric("Estimated field — object", f"{float(fb):.3f} mT")
+
+        i1, i2, i3 = st.columns(3)
+        i1.image(a, caption="Magnet only", use_container_width=True)
+        i2.image(b, caption="Magnet + object", use_container_width=True)
+        i3.image(diff_image(a, b), caption="Difference", use_container_width=True)
+
+        st.subheader("CRT response heatmap")
+        st.image(heatmap(ref, a), caption="Relative CRT response", use_container_width=True)
+
+with video:
+    st.header("🎥 Video magnetic-field analysis")
+    st.write("This mode follows the changing red/green/blue CRT response frame by frame.")
+
+    vf = st.file_uploader(
+        "Upload CRT video",
+        type=["mp4", "mov", "avi", "mkv", "webm"],
+        key="video"
     )
 
-with c2:
-    obj_file = st.file_uploader(
-        "B — Same magnet/setup, object inserted between magnet and CRT",
+    vr = st.file_uploader(
+        "Reference CRT image",
         type=["png", "jpg", "jpeg", "webp"],
-        key="measurement_obj"
+        key="video_ref"
     )
 
-if ref_file and obj_file:
-    ref = load_image(ref_file)
-    obj = load_image(obj_file)
+    every = st.slider("Analyze every Nth frame", 1, 30, 5)
+    max_frames = st.slider("Maximum frames", 50, 1000, 300, 50)
 
-    if ref_cal_file:
-        calibration_reference = load_image(ref_cal_file)
-    else:
-        calibration_reference = ref
+    if vf and vr and st.button("🧲 ANALYZE VIDEO", type="primary"):
+        reference = Image.open(vr).convert("RGB")
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+        tmp.write(vf.read())
+        tmp.close()
 
-    s_ref = response_score(calibration_reference, ref)
-    s_obj = response_score(calibration_reference, obj)
+        with st.spinner("Analyzing video..."):
+            data = analyze_video(tmp.name, reference, every, max_frames)
 
-    attenuation = None
-    if abs(s_ref) > 1e-12:
-        attenuation = max(
-            0.0,
-            min(100.0, (s_ref - s_obj) / s_ref * 100.0)
-        )
+        st.success("Video analysis completed.")
 
-    est_ref = None
-    est_obj = None
-    unc_ref = None
-    unc_obj = None
+        st.subheader("🔴🟢🔵 Color response")
+        st.line_chart(data[["Time_s", "Red", "Green", "Blue"]].set_index("Time_s"))
 
-    if model is not None:
-        est_ref = float(model.predict([[s_ref]])[0])
-        est_obj = float(model.predict([[s_obj]])[0])
+        st.subheader("🧲 CRT magnetic response")
+        st.line_chart(data[["Time_s", "CRT_Response"]].set_index("Time_s"))
 
-        unc_ref = estimate_uncertainty(
-            model,
-            cal_table["Response score"],
-            cal_table["Known field (mT)"],
-            s_ref
-        )
-
-        unc_obj = estimate_uncertainty(
-            model,
-            cal_table["Response score"],
-            cal_table["Known field (mT)"],
-            s_obj
-        )
-
-    st.subheader("Results")
-
-    r1, r2, r3 = st.columns(3)
-
-    with r1:
-        st.metric("Response — magnet only", f"{s_ref:.6f}")
-        if est_ref is not None:
+        if model:
+            data["Estimated_Field_mT"] = model.predict(data[["CRT_Response"]])
+            st.subheader("Estimated magnetic field")
+            st.line_chart(data[["Time_s", "Estimated_Field_mT"]].set_index("Time_s"))
             st.metric(
-                "Estimated field — magnet only",
-                f"{est_ref:.3f} mT"
-            )
-
-    with r2:
-        st.metric("Response — object inserted", f"{s_obj:.6f}")
-        if est_obj is not None:
-            st.metric(
-                "Estimated field — after object",
-                f"{est_obj:.3f} mT"
-            )
-
-    with r3:
-        if attenuation is not None:
-            st.metric(
-                "Estimated attenuation",
-                f"{attenuation:.2f}%"
+                "Maximum estimated field",
+                f"{data['Estimated_Field_mT'].max():.3f} mT"
             )
         else:
-            st.metric("Estimated attenuation", "—")
+            st.info("Load calibration images to convert response into estimated mT.")
 
-    if unc_ref is not None or unc_obj is not None:
-        st.caption(
-            "Approximate calibration-model uncertainty only: "
-            f"before ≈ {unc_ref:.3f} mT, after ≈ {unc_obj:.3f} mT. "
-            "Camera noise, CRT drift and geometry errors are not included."
+        st.dataframe(data, use_container_width=True)
+        csv = data.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "📥 Download video analysis CSV",
+            csv,
+            "crt_magnetic_field_video.csv",
+            "text/csv"
         )
 
-    st.subheader("CRT images")
+        try:
+            os.remove(tmp.name)
+        except Exception:
+            pass
 
-    i1, i2, i3 = st.columns(3)
-
-    i1.image(
-        ref,
-        caption="A — Magnet only",
-        use_container_width=True
-    )
-
-    i2.image(
-        obj,
-        caption="B — Object inserted",
-        use_container_width=True
-    )
-
-    a = prep(center_crop(ref))
-    b = prep(center_crop(obj))
-
-    diff = cv2.absdiff(a, b)
-    diff = cv2.normalize(
-        diff, None, 0, 255, cv2.NORM_MINMAX
-    )
-
-    i3.image(
-        diff,
-        caption="A vs B difference",
-        use_container_width=True
-    )
-
-    st.subheader("Interpretation")
-
-    if model is None:
-        st.info(
-            "No absolute mT estimate is shown because no calibration curve is loaded. "
-            "Upload calibration images with known field values in the sidebar."
-        )
-    else:
-        st.write(
-            f"The calibrated model maps the image-response score to approximately "
-            f"{est_ref:.3f} mT before the object and "
-            f"{est_obj:.3f} mT after the object."
-        )
-
-    st.write(
-        "The attenuation number is the percentage reduction in the image-response "
-        "metric between the magnet-only image and the object-inserted image. "
-        "It is not automatically a material shielding coefficient. "
-        "For a physical attenuation claim, independently validate the field before "
-        "and after the object with a Hall probe/gaussmeter."
-    )
-
-else:
-    st.info(
-        "Upload the two measurement images above. "
-        "For an absolute mT estimate, first create a calibration set "
-        "using known magnetic-field measurements."
-    )
-
-
-# ---------------- Experimental procedure ----------------
 st.divider()
-st.header("Recommended calibration procedure")
-
-st.markdown(
-    """
-**For a useful experimental result:**
-
-1. Keep the CRT, camera position, focus, exposure, brightness and contrast fixed.
-2. Place a calibrated Hall probe/gaussmeter at the same measurement location.
-3. Record several known fields, for example 0, 5, 10, 20 and 30 mT.
-4. Capture one CRT image at each known field.
-5. Upload those images as the calibration set and enter their measured mT values.
-6. For attenuation, capture **magnet only** and then **magnet + test object**.
-7. Do not move the camera, CRT or magnet between those two measurements.
-8. Repeat every point several times and average the results.
-"""
-)
-
 st.caption(
-    "Prototype image-analysis software. Absolute magnetic-field accuracy depends "
-    "on the calibration data and the physical CRT/electron-beam setup."
+    "Experimental image-analysis prototype. Validate mT values with a calibrated Hall probe or gaussmeter."
 )
