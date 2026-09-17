@@ -3,6 +3,7 @@ import numpy as np
 import pandas as pd
 from PIL import Image
 import cv2
+import os
 from sklearn.linear_model import LinearRegression
 from sklearn.preprocessing import PolynomialFeatures
 from sklearn.pipeline import make_pipeline
